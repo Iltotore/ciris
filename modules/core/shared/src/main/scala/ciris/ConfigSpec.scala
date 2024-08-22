@@ -22,6 +22,8 @@ sealed trait ConfigSpec[A] {
 
   def default(value: A): ConfigSpec[A] = Default(this, value)
 
+  def description(desc: String): ConfigSpec[A] = Description(this, desc)
+
   def or(right: ConfigSpec[A]): ConfigSpec[A] = {
     def getAlternatives(spec: ConfigSpec[A]) = spec match {
       case Alternatives(alternatives) => alternatives
@@ -33,12 +35,12 @@ sealed trait ConfigSpec[A] {
 
   def as[B](implicit codec: ConfigCodec[A, B]): ConfigSpec[B] = Codec(this, codec)
 
-  protected def fieldsRec(defaultValue: Option[A]): List[ConfigField]
+  protected def fieldsRec(description: Option[String], defaultValue: Option[A]): List[ConfigField]
 
   /**
     * The fields of this configuration specification.
     */
-  lazy val fields: List[ConfigField] = fieldsRec(None)
+  lazy val fields: List[ConfigField] = fieldsRec(None, None)
 
   def toConfigValue[F[_]]: ConfigValue[F, A]
 
@@ -52,56 +54,71 @@ object ConfigSpec {
     override def toConfigValue[F[_]]: ConfigValue[F, A] =
       ConfigValue.loaded(ConfigKey("pure value"), value)
 
-    override protected def fieldsRec(defaultValue: Option[A]): List[ConfigField] = Nil
+    override protected def fieldsRec(description: Option[String], defaultValue: Option[A]): List[ConfigField] = Nil
   }
+
   case class Environment(key: String) extends Leaf[String] {
     override def toConfigValue[F[_]]: ConfigValue[F, String] = ciris.env(key)
 
-    override protected def fieldsRec(defaultValue: Option[String]): List[ConfigField] = List(
-      ConfigField(ConfigKey.env(key), defaultValue)
+    override protected def fieldsRec(description: Option[String], defaultValue: Option[String]): List[ConfigField] = List(
+      ConfigField(ConfigKey.env(key), description, defaultValue)
     )
   }
+
   case class Property(key: String) extends Leaf[String] {
     override def toConfigValue[F[_]]: ConfigValue[F, String] = ciris.prop(key)
 
-    override protected def fieldsRec(defaultValue: Option[String]): List[ConfigField] = List(
-      ConfigField(ConfigKey.prop(key), defaultValue)
+    override protected def fieldsRec(description: Option[String], defaultValue: Option[String]): List[ConfigField] = List(
+      ConfigField(ConfigKey.prop(key), description, defaultValue)
     )
   }
+
   case class Secret[A](spec: ConfigSpec[A], show: Show[A]) extends ConfigSpec[SecretValue[A]] {
     override def toConfigValue[F[_]]: ConfigValue[F, SecretValue[A]] =
       spec.toConfigValue[F].secret(show)
 
-    override protected def fieldsRec(defaultValue: Option[SecretValue[A]]): List[ConfigField] =
-      spec.fieldsRec(defaultValue.map(_.value))
+    override protected def fieldsRec(description: Option[String], defaultValue: Option[SecretValue[A]]): List[ConfigField] =
+      spec.fieldsRec(description, defaultValue.map(_.value))
   }
+
   case class UseOnceSecret[A](spec: ConfigSpec[A], ev: A <:< Array[Char])
       extends ConfigSpec[UseOnceSecretValue] {
     override def toConfigValue[F[_]]: ConfigValue[F, UseOnceSecretValue] =
       spec.toConfigValue[F].useOnceSecret(ev)
 
-    override protected def fieldsRec(defaultValue: Option[UseOnceSecretValue]): List[ConfigField] =
-      spec.fieldsRec(None) // UseOnceSecret's value cannot be used
+    override protected def fieldsRec(description: Option[String], defaultValue: Option[UseOnceSecretValue]): List[ConfigField] =
+      spec.fieldsRec(description, None) // UseOnceSecret's value cannot be used
   }
+
   case class Default[A](spec: ConfigSpec[A], defaultValue: A) extends ConfigSpec[A] {
     override def toConfigValue[F[_]]: ConfigValue[F, A] =
       spec.toConfigValue[F].default(defaultValue)
 
-    override protected def fieldsRec(discarded: Option[A]): List[ConfigField] =
-      spec.fieldsRec(Some(defaultValue))
+    override protected def fieldsRec(description: Option[String], discarded: Option[A]): List[ConfigField] =
+      spec.fieldsRec(description, Some(defaultValue))
   }
+
+  case class Description[A](spec: ConfigSpec[A], description: String) extends ConfigSpec[A] {
+    override def toConfigValue[F[_]]: ConfigValue[F,A] =
+      spec.toConfigValue[F]
+
+    override protected def fieldsRec(discarded: Option[String], defaultValue: Option[A]): List[ConfigField] =
+      spec.fieldsRec(Some(description), defaultValue)
+  }
+
   case class Alternatives[A](alternatives: NonEmptyList[ConfigSpec[A]]) extends ConfigSpec[A] {
     override def toConfigValue[F[_]]: ConfigValue[F, A] =
       alternatives.map(_.toConfigValue[F]).reduceLeft(_ or _)
 
-    override protected def fieldsRec(defaultValue: Option[A]): List[ConfigField] =
-      alternatives.toList.flatMap(_.fieldsRec(defaultValue))
+    override protected def fieldsRec(description: Option[String], defaultValue: Option[A]): List[ConfigField] =
+      alternatives.toList.flatMap(_.fieldsRec(description, defaultValue))
   }
+
   case class IsoMap[A, B](spec: ConfigSpec[A], f: A => B, g: B => A) extends ConfigSpec[B] {
     override def toConfigValue[F[_]]: ConfigValue[F, B] = spec.toConfigValue[F].map(f)
 
-    override protected def fieldsRec(defaultValue: Option[B]): List[ConfigField] =
-      spec.fieldsRec(defaultValue.map(g))
+    override protected def fieldsRec(description: Option[String], defaultValue: Option[B]): List[ConfigField] =
+      spec.fieldsRec(description, defaultValue.map(g))
   }
 
   case class Codec[A, B](spec: ConfigSpec[A], codec: ConfigCodec[A, B]) extends ConfigSpec[B] {
@@ -112,16 +129,16 @@ object ConfigSpec {
 
     override def toConfigValue[F[_]]: ConfigValue[F, B] = spec.toConfigValue[F].as(decoder)
 
-    override protected def fieldsRec(defaultValue: Option[B]): List[ConfigField] =
-      spec.fieldsRec(defaultValue.map(codec.encode))
+    override protected def fieldsRec(description: Option[String], defaultValue: Option[B]): List[ConfigField] =
+      spec.fieldsRec(description, defaultValue.map(codec.encode))
   }
 
   case class Product[A, B](specA: ConfigSpec[A], specB: ConfigSpec[B]) extends ConfigSpec[(A, B)] {
     override def toConfigValue[F[_]]: ConfigValue[F, (A, B)] =
       specA.toConfigValue[F].product(specB.toConfigValue[F])
 
-    override protected def fieldsRec(defaultValue: Option[(A, B)]): List[ConfigField] =
-      specA.fieldsRec(defaultValue.map(_._1)) ++ specB.fieldsRec(defaultValue.map(_._2))
+    override protected def fieldsRec(description: Option[String], defaultValue: Option[(A, B)]): List[ConfigField] =
+      specA.fieldsRec(description, defaultValue.map(_._1)) ++ specB.fieldsRec(description, defaultValue.map(_._2))
   }
 
   def env(key: String): ConfigSpec[String] = Environment(key)
