@@ -17,7 +17,8 @@ sealed trait ConfigSpec[A] {
 
   def secret(implicit show: Show[A]): ConfigSpec[SecretValue[A]] = Secret(this, show)
 
-  def useOnceSecret(implicit ev: A <:< Array[Char]): ConfigSpec[UseOnceSecretValue] = UseOnceSecret(this, ev)
+  def useOnceSecret(implicit ev: A <:< Array[Char]): ConfigSpec[UseOnceSecretValue] =
+    UseOnceSecret(this, ev)
 
   def default(value: A): ConfigSpec[A] = Default(this, value)
 
@@ -32,14 +33,12 @@ sealed trait ConfigSpec[A] {
 
   def as[B](implicit codec: ConfigCodec[A, B]): ConfigSpec[B] = Codec(this, codec)
 
-  /**
-    * Move default values to the leaves of this spec.
-    *   
-    * @return a new [[ConfigSpec]] equivalent to this one but with default values at its leaves
-    */
-  lazy val loweredDefaults: ConfigSpec[A] = loweredDefaultsRec(None)
+  protected def fieldsRec(defaultValue: Option[A]): List[ConfigField]
 
-  protected def loweredDefaultsRec(defaultValue: Option[A]): ConfigSpec[A]
+  /**
+    * The fields of this configuration specification.
+    */
+  lazy val fields: List[ConfigField] = fieldsRec(None)
 
   def toConfigValue[F[_]]: ConfigValue[F, A]
 
@@ -47,81 +46,99 @@ sealed trait ConfigSpec[A] {
 }
 
 object ConfigSpec {
-  sealed trait Leaf[A] extends ConfigSpec[A] {
-    override protected def loweredDefaultsRec(defaultValue: Option[A]): ConfigSpec[A] =
-      defaultValue.fold[ConfigSpec[A]](this)(Default(this, _))
-  }
+  sealed trait Leaf[A] extends ConfigSpec[A]
 
   case class Pure[A](value: A) extends Leaf[A] {
-    override def toConfigValue[F[_]]: ConfigValue[F,A] = ConfigValue.loaded(ConfigKey("pure value"), value)
+    override def toConfigValue[F[_]]: ConfigValue[F, A] =
+      ConfigValue.loaded(ConfigKey("pure value"), value)
+
+    override protected def fieldsRec(defaultValue: Option[A]): List[ConfigField] = Nil
   }
   case class Environment(key: String) extends Leaf[String] {
     override def toConfigValue[F[_]]: ConfigValue[F, String] = ciris.env(key)
+
+    override protected def fieldsRec(defaultValue: Option[String]): List[ConfigField] = List(
+      ConfigField(ConfigKey.env(key), defaultValue)
+    )
   }
   case class Property(key: String) extends Leaf[String] {
     override def toConfigValue[F[_]]: ConfigValue[F, String] = ciris.prop(key)
+
+    override protected def fieldsRec(defaultValue: Option[String]): List[ConfigField] = List(
+      ConfigField(ConfigKey.prop(key), defaultValue)
+    )
   }
   case class Secret[A](spec: ConfigSpec[A], show: Show[A]) extends ConfigSpec[SecretValue[A]] {
-    override def toConfigValue[F[_]]: ConfigValue[F,SecretValue[A]] = spec.toConfigValue[F].secret(show)
+    override def toConfigValue[F[_]]: ConfigValue[F, SecretValue[A]] =
+      spec.toConfigValue[F].secret(show)
 
-    override protected def loweredDefaultsRec(defaultValue: Option[SecretValue[A]]): ConfigSpec[SecretValue[A]] =
-      Secret(spec.loweredDefaultsRec(defaultValue.map(_.value)), show)
+    override protected def fieldsRec(defaultValue: Option[SecretValue[A]]): List[ConfigField] =
+      spec.fieldsRec(defaultValue.map(_.value))
   }
-  case class UseOnceSecret[A](spec: ConfigSpec[A], ev: A <:< Array[Char]) extends ConfigSpec[UseOnceSecretValue] {
-    override def toConfigValue[F[_]]: ConfigValue[F,UseOnceSecretValue] = spec.toConfigValue[F].useOnceSecret(ev)
+  case class UseOnceSecret[A](spec: ConfigSpec[A], ev: A <:< Array[Char])
+      extends ConfigSpec[UseOnceSecretValue] {
+    override def toConfigValue[F[_]]: ConfigValue[F, UseOnceSecretValue] =
+      spec.toConfigValue[F].useOnceSecret(ev)
 
-    override protected def loweredDefaultsRec(defaultValue: Option[UseOnceSecretValue]): ConfigSpec[UseOnceSecretValue] =
-      defaultValue.fold[ConfigSpec[UseOnceSecretValue]](this)(Default(this, _))
+    override protected def fieldsRec(defaultValue: Option[UseOnceSecretValue]): List[ConfigField] =
+      spec.fieldsRec(None) // UseOnceSecret's value cannot be used
   }
   case class Default[A](spec: ConfigSpec[A], defaultValue: A) extends ConfigSpec[A] {
-    override def toConfigValue[F[_]]: ConfigValue[F,A] = spec.toConfigValue[F].default(defaultValue)
+    override def toConfigValue[F[_]]: ConfigValue[F, A] =
+      spec.toConfigValue[F].default(defaultValue)
 
-    override protected def loweredDefaultsRec(defaultValueParam: Option[A]): ConfigSpec[A] =
-      spec.loweredDefaultsRec(defaultValueParam.orElse(Some(defaultValue)))
+    override protected def fieldsRec(discarded: Option[A]): List[ConfigField] =
+      spec.fieldsRec(Some(defaultValue))
   }
   case class Alternatives[A](alternatives: NonEmptyList[ConfigSpec[A]]) extends ConfigSpec[A] {
-    override def toConfigValue[F[_]]: ConfigValue[F,A] = alternatives.map(_.toConfigValue[F]).reduceLeft(_ or _)
+    override def toConfigValue[F[_]]: ConfigValue[F, A] =
+      alternatives.map(_.toConfigValue[F]).reduceLeft(_ or _)
 
-    override protected def loweredDefaultsRec(defaultValue: Option[A]): ConfigSpec[A] =
-      Alternatives(alternatives.map(_.loweredDefaultsRec(defaultValue)))
+    override protected def fieldsRec(defaultValue: Option[A]): List[ConfigField] =
+      alternatives.toList.flatMap(_.fieldsRec(defaultValue))
   }
   case class IsoMap[A, B](spec: ConfigSpec[A], f: A => B, g: B => A) extends ConfigSpec[B] {
-    override def toConfigValue[F[_]]: ConfigValue[F,B] = spec.toConfigValue[F].map(f)
+    override def toConfigValue[F[_]]: ConfigValue[F, B] = spec.toConfigValue[F].map(f)
 
-    override protected def loweredDefaultsRec(defaultValue: Option[B]): ConfigSpec[B] =
-      IsoMap(spec.loweredDefaultsRec(defaultValue.map(g)), f, g)
+    override protected def fieldsRec(defaultValue: Option[B]): List[ConfigField] =
+      spec.fieldsRec(defaultValue.map(g))
   }
 
   case class Codec[A, B](spec: ConfigSpec[A], codec: ConfigCodec[A, B]) extends ConfigSpec[B] {
     private lazy val decoder = ConfigDecoder.instance(codec.decode)
 
-    override def as[C](implicit codecC: ConfigCodec[B,C]): ConfigSpec[C] =
-      Codec(spec, codec.imapEither(codecC.decode)(codecC.encode)) 
+    override def as[C](implicit codecC: ConfigCodec[B, C]): ConfigSpec[C] =
+      Codec(spec, codec.imapEither(codecC.decode)(codecC.encode))
 
-    override def toConfigValue[F[_]]: ConfigValue[F,B] = spec.toConfigValue[F].as(decoder)
+    override def toConfigValue[F[_]]: ConfigValue[F, B] = spec.toConfigValue[F].as(decoder)
 
-    override protected def loweredDefaultsRec(defaultValue: Option[B]): ConfigSpec[B] =
-      Codec(spec.loweredDefaultsRec(defaultValue.map(codec.encode)), codec)
+    override protected def fieldsRec(defaultValue: Option[B]): List[ConfigField] =
+      spec.fieldsRec(defaultValue.map(codec.encode))
   }
 
   case class Product[A, B](specA: ConfigSpec[A], specB: ConfigSpec[B]) extends ConfigSpec[(A, B)] {
-    override def toConfigValue[F[_]]: ConfigValue[F,(A, B)] = specA.toConfigValue[F].product(specB.toConfigValue[F])
+    override def toConfigValue[F[_]]: ConfigValue[F, (A, B)] =
+      specA.toConfigValue[F].product(specB.toConfigValue[F])
 
-    override protected def loweredDefaultsRec(defaultValue: Option[(A, B)]): ConfigSpec[(A, B)] =
-      defaultValue.fold(this)(v => Product(specA.default(v._1), specB.default(v._2)))
+    override protected def fieldsRec(defaultValue: Option[(A, B)]): List[ConfigField] =
+      specA.fieldsRec(defaultValue.map(_._1)) ++ specB.fieldsRec(defaultValue.map(_._2))
   }
 
   def env(key: String): ConfigSpec[String] = Environment(key)
   def prop(key: String): ConfigSpec[String] = Property(key)
-  def oneOf[A](alternatives: NonEmptyList[ConfigSpec[A]]): ConfigSpec[A] = Alternatives(alternatives)
+  def oneOf[A](alternatives: NonEmptyList[ConfigSpec[A]]): ConfigSpec[A] = Alternatives(
+    alternatives
+  )
 
-  implicit val invariantSemigroupalForSpec: InvariantSemigroupal[ConfigSpec] = new InvariantSemigroupal[ConfigSpec] {
+  implicit val invariantSemigroupalForSpec: InvariantSemigroupal[ConfigSpec] =
+    new InvariantSemigroupal[ConfigSpec] {
 
-    override def imap[A, B](fa: ConfigSpec[A])(f: A => B)(g: B => A): ConfigSpec[B] = fa match {
-      case IsoMap(spec, f0, g0) => IsoMap(spec, f0 andThen f, g0 compose g)
-      case _ => IsoMap(fa, f, g)
+      override def imap[A, B](fa: ConfigSpec[A])(f: A => B)(g: B => A): ConfigSpec[B] = fa match {
+        case IsoMap(spec, f0, g0) => IsoMap(spec, f0 andThen f, g0 compose g)
+        case _                    => IsoMap(fa, f, g)
+      }
+
+      override def product[A, B](fa: ConfigSpec[A], fb: ConfigSpec[B]): ConfigSpec[(A, B)] =
+        Product(fa, fb)
     }
-
-    override def product[A, B](fa: ConfigSpec[A], fb: ConfigSpec[B]): ConfigSpec[(A, B)] = Product(fa, fb)
-  }
 }

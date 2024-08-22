@@ -37,9 +37,9 @@ sealed abstract class ConfigCodec[A, B] {
     )
 
   /**
-  * Returns a new [[ConfigCodec]] which applies the
-  * specified function on the value before decoding.
-  */
+    * Returns a new [[ConfigCodec]] which applies the
+    * specified function on the value before decoding.
+    */
   final def icontramap[C](f: C => A)(g: A => C): ConfigCodec[C, B] =
     ConfigCodec.instance(
       (key, value) => decode(key, f(value)),
@@ -76,7 +76,9 @@ sealed abstract class ConfigCodec[A, B] {
     * Returns a new [[ConfigCodec]] which successfully decodes
     * values for which the specified function returns `Right`.
     */
-  final def imapEither[C](f: (Option[ConfigKey], B) => Either[ConfigError, C])(g: C => B): ConfigCodec[A, C] =
+  final def imapEither[C](
+    f: (Option[ConfigKey], B) => Either[ConfigError, C]
+  )(g: C => B): ConfigCodec[A, C] =
     ConfigCodec.instance(
       (key, value) => decode(key, value).flatMap(f(key, _)),
       g andThen encode
@@ -270,8 +272,8 @@ object ConfigCodec {
   /**
     * @group Codecs
     */
-  implicit final def secretConfigCodec[A, B](implicit
-    codec: ConfigCodec[A, B],
+  implicit final def secretConfigCodec[A, B](
+    implicit codec: ConfigCodec[A, B],
     show: Show[A]
   ): ConfigCodec[Secret[A], B] =
     codec.icontramap[Secret[A]](_.value)(Secret.apply)
@@ -358,8 +360,8 @@ object ConfigCodec {
     */
   implicit final def ConfigCodecInvariant[C]: Invariant[ConfigCodec[C, *]] =
     new Invariant[ConfigCodec[C, *]] {
-      
-      override def imap[A, B](fa: ConfigCodec[C,A])(f: A => B)(g: B => A): ConfigCodec[C,B] =
+
+      override def imap[A, B](fa: ConfigCodec[C, A])(f: A => B)(g: B => A): ConfigCodec[C, B] =
         fa.imap(f)(g)
     }
 }
